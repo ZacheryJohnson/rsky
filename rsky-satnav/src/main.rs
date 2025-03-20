@@ -18,7 +18,7 @@ use hex::encode as hex_encode;
 // For converting Ipld -> JSON for a readable display.
 use serde_json;
 use std::collections::HashMap;
-
+use std::ops::Deref;
 // Use iroh-car's asynchronous CarReader.
 use iroh_car::CarReader;
 
@@ -27,8 +27,10 @@ const MAIN_CSS: Asset = asset!("/assets/main.css");
 const FAVICON: Asset = asset!("/assets/favicon.ico");
 
 use components::Hero;
+use crate::diff::mst_diff;
 
 mod components;
+mod diff;
 
 // ----------------------------------------------------------
 // Data structures
@@ -43,6 +45,9 @@ struct CarTree {
 
     /// MST-based “repo entries” found by walking the MST
     mst_entries: Vec<MstEntry>,
+
+    /// Optional name for the archival, which is useful in the case of diffing two archives.
+    archive_name: Option<String>,
 }
 
 #[derive(Props, PartialEq, Clone, Debug)]
@@ -291,7 +296,7 @@ fn walk_mst(
 // Collapsible directory listing component
 // ----------------------------------------------------------
 #[component]
-fn MstRepoView(mst_entries: Vec<MstEntry>) -> Element {
+fn MstRepoView(archive_name: String, mst_entries: Vec<MstEntry>) -> Element {
     // Group them by collection
     let mut grouped: HashMap<String, Vec<MstEntry>> = HashMap::new();
     for entry in mst_entries {
@@ -321,7 +326,7 @@ fn MstRepoView(mst_entries: Vec<MstEntry>) -> Element {
                     open: "true", // keep the root open by default
                     summary {
                         class: "cursor-pointer font-semibold text-blue-700",
-                        "Root"
+                        "{archive_name} Root"
                     }
                     ul {
                         class: "ml-6 list-none", // indent the child items
@@ -374,38 +379,91 @@ fn main() {
 
 #[component]
 fn App() -> Element {
-    let car_data = use_signal(|| None::<CarTree>);
+    let target_car_data = use_signal(|| None::<CarTree>);
+    let source_car_data = use_signal(|| None::<CarTree>);
 
     let on_file_change = {
-        let car_data = car_data.clone();
+        let target_car_data = target_car_data.clone();
+        let source_car_data = source_car_data.clone();
+
         move |evt: Event<FormData>| {
-            if let Some(target) = evt.try_as_web_event().unwrap().target() {
-                if let Ok(input) = target.dyn_into::<HtmlInputElement>() {
-                    if let Some(file_list) = input.files() {
-                        if let Some(file) = file_list.get(0) {
-                            let mut car_data = car_data.clone();
-                            spawn_local(async move {
-                                match load_car(file).await {
-                                    Ok(tree) => car_data.set(Some(tree)),
-                                    Err(err) => {
-                                        web_sys::console::error_1(&JsValue::from_str(&format!(
-                                            "{err:?}"
-                                        )));
-                                    }
-                                }
-                            });
+            let Some(target) = evt.try_as_web_event().unwrap().target() else {
+                return;
+            };
+
+            let Ok(input) = target.dyn_into::<HtmlInputElement>() else {
+                return;
+            };
+
+            let Some(file_list) = input.files() else {
+                return;
+            };
+
+            if file_list.length() > 1 {
+                let Some(target_file) = file_list.get(0) else {
+                    return;
+                };
+
+                let Some(source_file) = file_list.get(1) else {
+                    return;
+                };
+
+                spawn_local(async move {
+                    match load_car_from_file(target_file).await {
+                        Ok(tree) => target_car_data.clone().set(Some(tree)),
+                        Err(err) => {
+                            web_sys::console::error_1(&JsValue::from_str(&format!(
+                                "{err:?}"
+                            )));
                         }
                     }
-                }
+                    match load_car_from_file(source_file).await {
+                        Ok(tree) => source_car_data.clone().set(Some(tree)),
+                        Err(err) => {
+                            web_sys::console::error_1(&JsValue::from_str(&format!(
+                                "{err:?}"
+                            )));
+                        }
+                    }
+                    mst_diff(target_car_data.clone(), source_car_data.clone());
+                });
+            } else {
+                let Some(file) = file_list.get(0) else {
+                    return;
+                };
+                spawn_local(async move {
+                    match load_car_from_file(file).await {
+                        Ok(tree) => target_car_data.clone().set(Some(tree)),
+                        Err(err) => {
+                            web_sys::console::error_1(&JsValue::from_str(&format!(
+                                "{err:?}"
+                            )));
+                        }
+                    }
+                });
             }
         }
     };
 
-    let content = match car_data.as_ref() {
-        Some(tree) => rsx! {
-            MstRepoView { mst_entries: tree.mst_entries.clone() }
+    let content = match (target_car_data.as_ref(), source_car_data.as_ref()) {
+        (Some(target_tree), None) => rsx! {
+            MstRepoView {
+                archive_name: target_tree.archive_name.to_owned().unwrap_or(String::from("Root")),
+                mst_entries: target_tree.mst_entries.clone(),
+            }
         },
-        None => rsx! {
+        (Some(target_tree), Some(source_tree)) => rsx! {
+            MstRepoView {
+                archive_name: target_tree.archive_name.to_owned().unwrap_or(String::from("Root")),
+                mst_entries: target_tree.mst_entries.clone(),
+            }
+
+            MstRepoView {
+                archive_name: source_tree.archive_name.to_owned().unwrap_or(String::from("Root")),
+                mst_entries: source_tree.mst_entries.clone(),
+            }
+        },
+        _ => rsx! {
             p { "No CAR file loaded yet." }
         },
     };
@@ -426,6 +484,7 @@ fn App() -> Element {
             input {
                 r#type: "file",
                 accept: ".car",
+                multiple: true,
                 onchange: on_file_change,
                 class: "bg-purple-500 hover:bg-purple-700 text-white font-bold py-2 px-4 rounded"
             }
@@ -434,13 +493,19 @@ fn App() -> Element {
     }
 }
 
+async fn load_car_from_file(file: web_sys::File) -> Result<CarTree> {
+    let file_name = file.name();
+    let blob = Blob::from(file);
+    let bytes = read_as_bytes(&blob).await?;
+
+    load_car(bytes, Some(file_name)).await
+}
+
 // ----------------------------------------------------------
 // CAR loading logic is unchanged. We store blocks for MST
 // decoding and build `mst_entries` for the UI.
 // ----------------------------------------------------------
-async fn load_car(file: web_sys::File) -> Result<CarTree> {
-    let blob = Blob::from(file);
-    let bytes = read_as_bytes(&blob).await?;
+async fn load_car(bytes: Vec<u8>, archive_name: Option<String>) -> Result<CarTree> {
     let mut cursor = Cursor::new(bytes);
 
     let mut reader = CarReader::new(&mut cursor)
@@ -505,6 +570,7 @@ async fn load_car(file: web_sys::File) -> Result<CarTree> {
     }
 
     Ok(CarTree {
+        archive_name,
         roots: root_cids,
         blocks,
         mst_entries,
