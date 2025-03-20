@@ -1,71 +1,112 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use dioxus::logger::tracing;
 use dioxus::prelude::*;
-use crate::CarTree;
+use ipld_core::cid::Cid;
+use crate::{read_commit, walk_mst_entries, BlockMap, CarTree, MstEntry};
+
+
+#[derive(Debug)]
+enum RecordDiffType {
+    Identical(String),
+    Added(String),
+    Updated(String, String),
+    Removed(String)
+}
+
+#[derive(Debug)]
+struct RecordDiff {
+    collection: String,
+    record_key: String,
+    diff_type: RecordDiffType,
+    data: String,
+}
 
 pub fn mst_diff(
     target_tree: Signal<Option<CarTree>>,
     source_tree: Signal<Option<CarTree>>,
-) -> () {
-    let target_tree_ref = target_tree.as_ref().unwrap();
-    let source_tree_ref = source_tree.as_ref().unwrap();
-    let (target_roots, target_blocks, target_entries) = {
-        (&target_tree_ref.roots, &target_tree_ref.blocks, &target_tree_ref.mst_entries)
+) -> Vec<MstEntry> {
+    let target_entries = &target_tree.as_ref().unwrap().mst_entries;
+    let source_entries = &source_tree.as_ref().unwrap().mst_entries;
+
+    let make_key_fn = |collection: &String, record_key: &String| {
+        format!("{collection}/{record_key}")
     };
-    let (source_roots, source_blocks, source_entries) = {
-        (&source_tree_ref.roots, &source_tree_ref.blocks, &source_tree_ref.mst_entries)
-    };
-    let target_block_mapping = target_blocks
-        .iter()
-        .map(|block| (block.cid.to_owned(), block.cli_ipld_json.to_owned()))
+
+    let mut source_entries = source_entries
+        .into_iter()
+        .map(|entry| {
+            (make_key_fn(&entry.collection, &entry.rkey), (entry.record_cid.to_owned(), entry.record_cli_json.to_owned()))
+        })
         .collect::<HashMap<_, _>>();
 
-    let source_block_mapping = source_blocks
-        .iter()
-        .map(|block| (block.cid.to_owned(), block.cli_ipld_json.to_owned()))
-        .collect::<HashMap<_, _>>();
+    // ZJ-TODO: we're assuming that the values returned by walk_mst_entries are sorted alphabetically
+    //          this should be enforced by tests and/or assertions but we're timeboxed
 
-    let target_entry_cids = target_entries
-        .iter()
-        .map(|entry| &entry.record_cid)
-        .collect::<HashSet<_>>();
+    let mut diffs = vec![];
+    for entry in target_entries {
+        let target_collection = &entry.collection;
+        let target_record_key = &entry.rkey;
+        let target_record_cid = &entry.record_cid;
 
-    let source_entry_cids = source_entries
-        .iter()
-        .map(|entry| &entry.record_cid)
-        .collect::<HashSet<_>>();
+        let target_key = make_key_fn(&target_collection, &target_record_key);
 
-    let new_addition_cids = source_entry_cids
-        .difference(&target_entry_cids)
-        .collect::<HashSet<_>>();
-    let new_removal_cids = target_entry_cids
-        .difference(&source_entry_cids)
-        .collect::<HashSet<_>>();
-
-    tracing::debug!("new_addition_cids: {:?}", new_addition_cids);
-    for cid in new_addition_cids {
-        let new_block = source_block_mapping.get(*cid).unwrap_or(&None);
-        tracing::debug!("\t{cid}: {new_block:?}");
+        // If both trees contain the record, it's either unchanged or updated
+        if let Some((source_record_cid, data)) = source_entries.remove(&target_key) {
+            let identical = source_record_cid == *target_record_cid;
+            diffs.push(RecordDiff {
+                collection: target_collection.to_owned(),
+                record_key: target_record_key.to_owned(),
+                diff_type: if identical {
+                    RecordDiffType::Identical(target_record_cid.to_owned())
+                } else {
+                    RecordDiffType::Updated(target_record_cid.to_owned(), source_record_cid)
+                },
+                data,
+            });
+        }
+        // If the source tree did not contain the record, it's been deleted
+        else {
+            diffs.push(RecordDiff {
+                collection: target_collection.to_owned(),
+                record_key: target_record_key.to_owned(),
+                diff_type: RecordDiffType::Removed(target_record_cid.to_owned()),
+                data: String::new(),
+            });
+        }
     }
-    tracing::debug!("new_removal_cids: {:?}", new_removal_cids);
-    for cid in new_removal_cids {
-        let deleted = target_block_mapping.get(*cid).unwrap_or(&None);
-        tracing::debug!("\t{cid}: {deleted:?}");
+
+    // If we have any remaining source tree entries, those are new
+    for (record_key, (cid, data)) in source_entries {
+        let key_split = record_key.split("/").collect::<Vec<_>>();
+        let collection = key_split[0];
+        let record_key = key_split[1];
+        diffs.push(RecordDiff {
+            collection: collection.to_string(),
+            record_key: record_key.to_string(),
+            diff_type: RecordDiffType::Added(cid),
+            data,
+        });
     }
+
+    construct_mst_from_diffs(diffs)
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::load_car;
-    use super::*;
+pub fn construct_mst_from_diffs(diffs: Vec<RecordDiff>) -> Vec<MstEntry> {
+    let mut mst_entries = vec![];
 
-    async fn get_older_tree() -> CarTree {
-        let bytes = include_bytes!("../test_data/2025-03-18-repo.car").to_vec();
-        load_car(bytes, Some(String::from("Older Tree"))).await.unwrap()
+    for diff in diffs {
+        match diff.diff_type {
+            RecordDiffType::Identical(_) | RecordDiffType::Removed(_) => {},
+            RecordDiffType::Added(cid) | RecordDiffType::Updated(_, cid) => {
+                mst_entries.push(MstEntry {
+                    collection: diff.collection.to_owned(),
+                    rkey: diff.record_key.to_owned(),
+                    record_cid: cid.to_owned(),
+                    record_cli_json: diff.data.to_owned(),
+                });
+            },
+        }
     }
 
-    async fn get_newer_tree() -> CarTree {
-        let bytes = include_bytes!("../test_data/2025-03-20-repo.car").to_vec();
-        load_car(bytes, Some(String::from("Newer Tree"))).await.unwrap()
-    }
+    mst_entries
 }

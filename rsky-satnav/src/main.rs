@@ -381,10 +381,12 @@ fn main() {
 fn App() -> Element {
     let target_car_data = use_signal(|| None::<CarTree>);
     let source_car_data = use_signal(|| None::<CarTree>);
+    let diff_car_data = use_signal(|| None::<Vec<MstEntry>>);
 
     let on_file_change = {
         let target_car_data = target_car_data.clone();
         let source_car_data = source_car_data.clone();
+        let diff_data = diff_car_data.clone();
 
         move |evt: Event<FormData>| {
             let Some(target) = evt.try_as_web_event().unwrap().target() else {
@@ -425,7 +427,8 @@ fn App() -> Element {
                             )));
                         }
                     }
-                    mst_diff(target_car_data.clone(), source_car_data.clone());
+                    let diff_entries = mst_diff(target_car_data.clone(), source_car_data.clone());
+                    diff_data.clone().set(Some(diff_entries));
                 });
             } else {
                 let Some(file) = file_list.get(0) else {
@@ -452,15 +455,38 @@ fn App() -> Element {
                 mst_entries: target_tree.mst_entries.clone(),
             }
         },
-        (Some(target_tree), Some(source_tree)) => rsx! {
-            MstRepoView {
-                archive_name: target_tree.archive_name.to_owned().unwrap_or(String::from("Root")),
-                mst_entries: target_tree.mst_entries.clone(),
-            }
+        (Some(target_tree), Some(source_tree)) => {
+            let diff = diff_car_data.as_ref();
 
-            MstRepoView {
-                archive_name: source_tree.archive_name.to_owned().unwrap_or(String::from("Root")),
-                mst_entries: source_tree.mst_entries.clone(),
+            if diff.is_some() {
+                rsx! {
+                    MstRepoView {
+                        archive_name: target_tree.archive_name.to_owned().unwrap_or(String::from("Root")),
+                        mst_entries: target_tree.mst_entries.clone(),
+                    }
+
+                    MstRepoView {
+                        archive_name: source_tree.archive_name.to_owned().unwrap_or(String::from("Root")),
+                        mst_entries: source_tree.mst_entries.clone(),
+                    }
+
+                    MstRepoView {
+                        archive_name: String::from("Diff"),
+                        mst_entries: diff.unwrap().to_owned(),
+                    }
+                }
+            } else {
+                rsx! {
+                    MstRepoView {
+                        archive_name: target_tree.archive_name.to_owned().unwrap_or(String::from("Root")),
+                        mst_entries: target_tree.mst_entries.clone(),
+                    }
+
+                    MstRepoView {
+                        archive_name: source_tree.archive_name.to_owned().unwrap_or(String::from("Root")),
+                        mst_entries: source_tree.mst_entries.clone(),
+                    }
+                }
             }
         },
         _ => rsx! {
